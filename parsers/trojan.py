@@ -1,0 +1,119 @@
+"""Парсер Trojan-ссылок в прокси-словарь Clash Meta (Mihomo).
+
+Формат ссылки:
+  trojan://password@host:port?type=...&security=...&sni=...&flow=...#Имя
+"""
+from urllib.parse import parse_qs, urlparse
+
+from .base import BaseParser, ParsedProxy
+from .utils import clean_name, split_host_port, validate_flow, validate_reality
+
+_NETWORK_ALIASES = {
+    "tcp": "tcp",
+    "raw": "tcp",
+    "ws": "ws",
+    "websocket": "ws",
+    "grpc": "grpc",
+    "http": "http",
+    "httpupgrade": "http",
+    "h2": "h2",
+    "xhttp": "xhttp",
+}
+
+
+class TrojanParser(BaseParser):
+    """Разбирает trojan:// ссылки в структуру для секции proxies."""
+
+    protocol = "trojan"
+
+    @classmethod
+    def parse(cls, raw: str) -> ParsedProxy:
+        parsed = urlparse(raw)
+        if parsed.scheme.lower() != cls.protocol:
+            raise ValueError(f"ожидалась схема '{cls.protocol}'")
+
+        userinfo, _, hostport = parsed.netloc.rpartition("@")
+        if not userinfo or not hostport:
+            raise ValueError("нет части password@host:port")
+
+        password, (host, port_s) = userinfo, split_host_port(hostport)
+        params = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
+
+        network = params.get("type", "tcp").lower()
+        network = _NETWORK_ALIASES.get(network, "tcp")
+        name = clean_name(parsed.fragment, f"{host}:{port_s}")
+
+        proxy: dict = {
+            "name": name,
+            "type": "trojan",
+            "server": host,
+            "port": int(port_s),
+            "password": password,
+            "udp": True,
+        }
+
+        sni = params.get("sni") or params.get("peer") or params.get("host")
+        if sni:
+            proxy["sni"] = sni
+
+        if params.get("alpn"):
+            proxy["alpn"] = [a.strip() for a in params["alpn"].split(",") if a.strip()]
+
+        if params.get("fp"):
+            proxy["client-fingerprint"] = params["fp"]
+
+        if params.get("flow"):
+            validate_flow(params["flow"])
+            proxy["flow"] = params["flow"]
+
+        if params.get("allowInsecure") in ("1", "true") or params.get("insecure") in ("1", "true"):
+            proxy["skip-cert-verify"] = True
+
+        security = params.get("security", "tls").lower()
+        if security == "reality":
+            pbk = params.get("pbk")
+            if not pbk:
+                raise ValueError("Reality-ссылка без pbk (public-key)")
+            validate_reality(pbk, params.get("sid", ""))
+            reality_opts = {"public-key": pbk}
+            if params.get("sid"):
+                reality_opts["short-id"] = params["sid"]
+            proxy["reality-opts"] = reality_opts
+
+        if network == "ws":
+            proxy["network"] = "ws"
+            ws_opts: dict = {}
+            if params.get("path"):
+                ws_opts["path"] = params["path"]
+            ws_opts["headers"] = {"Host": params.get("host") or sni or host}
+            proxy["ws-opts"] = ws_opts
+        elif network == "grpc":
+            proxy["network"] = "grpc"
+            service = params.get("serviceName") or params.get("service_name")
+            if service:
+                proxy["grpc-opts"] = {"grpc-service-name": service}
+        elif network in ("http", "h2"):
+            proxy["network"] = network
+            opts: dict = {
+                "path": [params.get("path") or "/"] if network == "http" else params.get("path") or "/"
+            }
+            host_hdr = params.get("host") or sni or host
+            if network == "http":
+                opts["headers"] = {"Host": [host_hdr]}
+            else:
+                opts["host"] = [host_hdr]
+            proxy[f"{network}-opts"] = opts
+        elif network == "xhttp":
+            proxy["network"] = "xhttp"
+            xhttp_opts: dict = {}
+            if params.get("path"):
+                xhttp_opts["path"] = params["path"]
+            host_hdr = params.get("host") or sni or host
+            if host_hdr:
+                xhttp_opts["host"] = host_hdr
+            if xhttp_opts:
+                proxy["xhttp-opts"] = xhttp_opts
+        else:
+            proxy["network"] = "tcp"
+
+        return ParsedProxy(name=name, data=proxy)
